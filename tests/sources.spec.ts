@@ -589,7 +589,7 @@ describe('github source', () => {
     expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.number)).toEqual([13])
     // The cursor moved together with the Issue it does not cover yet.
     expect(Date.parse(h.store.get<string>('github-since')!)).toBeGreaterThan(Date.parse('2026-09-08T00:00:00.000Z'))
-    expect(h.store.get('github-retry')).toEqual({ 12: { since: '2026-09-08T00:00:00.000Z', pr: false, attempts: 1, failedAt: expect.any(String) } })
+    expect(h.store.get('github-retry')).toEqual({ 12: { since: '2026-09-07T23:00:00.000Z', pr: false, attempts: 1, failedAt: expect.any(String) } })
     expect(h.store.threads.get('github:12')!.meta.pollError).toContain('Bad Gateway')
     Object.assign(routes, { notifications: [], 'issues/12': issue(12, { created_at: '2026-08-01T00:00:00Z' }),
       'issues/12/comments': [mention(2, 12, '2026-09-08T02:00:00Z')] })
@@ -858,9 +858,40 @@ describe('github source', () => {
     await pollRound(h)
     const expected = commentTrigger(comment, { number: 12, isPr: false, url }, 'conversation', 'agent-bot')
     expect(h.receive.mock.calls.map(([trigger]) => trigger)).toEqual([expected])
-    // An Issue has only its conversation; the comments are read since the notification cursor.
-    const since = encodeURIComponent('2026-09-08T00:00:00.000Z')
+    // An Issue has only its conversation; with no read position of its own, the comments start an hour before the
+    // notifications window.
+    const since = encodeURIComponent('2026-09-07T23:00:00.000Z')
     expect(reads.filter(path => path.includes('/comments'))).toEqual([`issues/12/comments?per_page=100&since=${since}`])
+    h.store.close()
+  })
+  it('reads a notified Thread from its own read position, so a comment GitHub reports late is taken in', async () => {
+    const h = host()
+    // The comment came before the notifications window opened, and GitHub only reported it afterwards.
+    h.store.set('github-cursor:12', '2026-09-09T00:05:00.000Z')
+    const comment: GithubComment = { id: 6, body: '@agent-bot take this', user: { login: 'alice', type: 'User' },
+      html_url: 'https://github.com/acme/widgets/issues/12#issuecomment-6', created_at: '2026-09-09T00:07:00.000Z',
+      updated_at: '2026-09-09T00:07:00.000Z' }
+    const late = issue(12, { created_at: '2026-08-01T00:00:00Z', updated_at: '2026-09-09T00:12:00.000Z' })
+    const { reads } = notify(h, [late], { 12: [comment] }, '2026-09-09T00:10:00.000Z')
+    await pollRound(h)
+    expect(reads.filter(path => path.includes('/comments')))
+      .toEqual([`issues/12/comments?per_page=100&since=${encodeURIComponent('2026-09-09T00:05:00.000Z')}`])
+    expect(h.receive.mock.calls.map(([trigger]) => trigger.text)).toEqual(['@agent-bot take this'])
+    h.store.close()
+  })
+  it('reads a Thread this Source never read from an hour before the window, so a late mention still arrives', async () => {
+    const h = host()
+    // No read position yet: the Issue existed before this Source saw the repository, and GitHub reported the mention
+    // long after the notifications window had moved past the comment.
+    const comment: GithubComment = { id: 7, body: '@agent-bot take this too', user: { login: 'alice', type: 'User' },
+      html_url: 'https://github.com/acme/widgets/issues/12#issuecomment-7', created_at: '2026-09-09T00:07:00.000Z',
+      updated_at: '2026-09-09T00:07:00.000Z' }
+    const late = issue(12, { created_at: '2026-08-01T00:00:00Z', updated_at: '2026-09-09T00:12:00.000Z' })
+    const { reads } = notify(h, [late], { 12: [comment] }, '2026-09-09T00:25:00.000Z')
+    await pollRound(h)
+    expect(reads.filter(path => path.includes('/comments')))
+      .toEqual([`issues/12/comments?per_page=100&since=${encodeURIComponent('2026-09-08T23:25:00.000Z')}`])
+    expect(h.receive.mock.calls.map(([trigger]) => trigger.text)).toEqual(['@agent-bot take this too'])
     h.store.close()
   })
   it('keeps one body Trigger for an Issue that a later poll reads again', async () => {

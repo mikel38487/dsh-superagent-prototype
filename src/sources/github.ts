@@ -154,6 +154,8 @@ const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOSt
 const stopped = (ctx: SourceContext, round: Round): boolean => !!round.signal?.aborted || !ctx.config(SOURCE)
 export interface Retry { since: string; pr: boolean; failedAt?: string; attempts?: number }
 const RETRY_WINDOW_MS = 24 * 3600_000
+/** How far before the notifications window a notified Thread this Source never read starts, so a mention GitHub reports late still reaches the gate. */
+const FIRST_READ_LOOKBACK_MS = 60 * 60_000
 /** True when GitHub returns HTTP 410 (Gone); HTTP 404 is retried because it can indicate revoked access to a private repository. */
 const deleted = (error: unknown): boolean => error instanceof CliError && error.code === 410
 /** Records a failed read on the Thread and in the round; deleted (410) or abandoned (24h+) threads do not fail the round. */
@@ -294,6 +296,17 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   ctx.report('github', { state: 'ready', detail: `${count} notifications; next poll ≥ ${interval}s${dropped}`, at: round.started })
   return interval
 }
+/**
+ * The point a notified Thread is read from. A Thread read before starts at its own read position, so a comment that
+ * GitHub reports after the notifications window moved past it is still taken in; reading it again only re-reads what
+ * the Source already stored, which `Intake.receive` drops as a duplicate. A Thread this Source never read has no
+ * position of its own and starts an hour before the notifications window, so a first read does not take in a long
+ * history yet still catches a mention GitHub reported late.
+ */
+function notificationStart(cursor: string | undefined, since: string): string {
+  if (cursor) return cursor
+  return new Date(Date.parse(since) - FIRST_READ_LOOKBACK_MS).toISOString()
+}
 /** Reads notifications since the cursor and each Issue or PR they name, advancing the cursor atomically with the retry map for failed reads; deleted (410) Issues are dropped once their error is recorded. */
 async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ count: number; interval: number }> {
   const { state } = ctx
@@ -320,7 +333,7 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
     const address = githubAddress(notification.subject.url ?? '', repository)
     if (!address || address.discussion || items.has(address.number)) continue
     const { number, pr } = address
-    items.set(number, { since: [state.get(KV.github.cursor(number)) ?? since, since].sort().at(-1)!, pr })
+    items.set(number, { since: notificationStart(state.get(KV.github.cursor(number)), since), pr })
   }
   for (const [number, item] of items) {
     if (stopped(ctx, round)) return { count: notifications.length, interval }
